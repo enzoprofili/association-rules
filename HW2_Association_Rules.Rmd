@@ -1,0 +1,200 @@
+---
+title: "Association Rules Report"
+author: "Enzo Profli"
+output:
+  bookdown::pdf_book:
+    fig_caption: yes
+    keep_tex: yes
+    toc: false
+    number_sections: true
+header-includes: 
+    \usepackage{graphicx}
+    \usepackage{float} 
+    \floatplacement{figure}{H}
+urlcolor: cyan
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, cache = TRUE)
+library(data.table)
+library(dplyr)
+library(factoextra)
+library(ggplot2)
+library(gridExtra)
+library(kableExtra)
+library(cluster)
+library(eeptools)
+library(arules)
+library(arulesViz)
+```
+
+## Executive Summary
+
+This report summarizes an effort to group stock keeping units (SKUs) into association rules, with the object of supplying a department store chain with item co-occurrence relationship data. The idea behind looking into these relationships is that the company can reshuffle items across its stores and put items that are frequently bought together in neighboring locations.
+
+Our analysis has been focused on 10 stores that represent the store geographically across the United States - these stores were determined utilizing a K-medoid algorithm. Moreover, the analysis focuses on SKUs that generated significant revenue in these 10 stores. Given this dimensionality reduction, we were able to run the association rules algorithm to determine which SKU purchase relationships are strongest. 
+
+Using the lift measure (given sufficient support and confidence), we were able to determine the top 100 implication relationships in the transactions data. These implication relationships are the main product of this analysis, and they should guide the company when reshuffling 20 SKUs across its store - maximizing item purchases and revenue in the process. These full rundown on these rules can be seen in Appendix A.
+
+## Problem Statement
+
+In this report, we look into a department store chain's transactions, in order to gather information on which items are frequently bought together. The objective is to supply the company management with relevant data to support future moves in stock keeping unit locations.
+
+## Assumptions
+
+Some of the analysis is based on a few assumptions and shortcomings:
+
+* The dataset is too large to conduct an analysis, and thus we must trim both the number of stores represented in the dataset and the number of SKUs available. The Methodology section explains how this was achieved.
+
+* During store clustering, we assume that, if stores are geographically close, they are similar. This analysis does not account for other variables, such as city size, GDP per capita, etc. This is a shortcoming because it is possible that these stores do not accurately represent the median store customer. These chosen stores might, for example, be skewed towards small-town customers, which might have different tastes and preferences. The clustering procedure is further explained in the Methodology section.
+
+* This analysis assumes that the variable group of STORE, TRANNUM, REGISTER and SALEDATE represent a unique transaction. Given this grouping, most of the transactions are one-SKU orders, which limits the power of our analysis.
+
+## Methodology
+
+Given that the transactions dataset contains 120 million rows, we must subset this dataset in order to conduct this analysis, because of hardware limitations. In order to do so, we have conducted a K-medoid analysis to focus on 10 stores that represent the chain, at least geographically. By conducting this clustering, we get 10 "centralized" stores in which we will focus our efforts. Figure \@ref(fig:appendixB) displays the results of the clustering, as well as the stores that were picked for this analysis. We see that this Figure resembles that of the US map, and we can note that many stores are located in Florida, while there are far fewer stores in the pacific Northwest. This clustering procedure reduces our dataset to 3.7 million rows, representing a substantial improvement in performance. 
+
+```{r load}
+depts <- fread("deptinfo.csv")
+depts <- depts[,1:2]
+names(depts) <- c("DEPT", "DEPTDESC")
+
+sku <- read.csv("skuinfo.csv", fill = TRUE, sep = ",", header = FALSE)
+sku <- sku[,1:10]
+names(sku) <- c("SKU", "DEPT", "CLASSID", "UPC", "STYLE", "COLOR", "SIZE", "PACKSIZE", "VENDOR", "BRAND")
+sku$SKU <- as.numeric(sku$SKU)
+sku <- sku %>%
+        filter(SKU != 0 | !is.na(SKU))
+
+sks <- fread("skstinfo.csv")
+skst <- sks[,1:4]
+names(skst) <- c("SKU", "STORE", "COST", "RETAIL")
+
+str <- fread("strinfo.csv")
+str <- str[,1:4]
+names(str) <- c("STORE", "CITY", "STATE", "ZIP")
+
+trn <- fread("trnsact.csv")
+```
+
+```{r transact}
+trnc <- trn %>% 
+          select(-one_of("V9", "V14"))
+
+names(trnc) <- c("SKU", "STORE", "REGISTER", "TRANNUM", "INTERID", "SALEDATE", "STYPE", "QUANTITY", "ORGPRICE", "AMT", "SEQ", "MIC")
+
+#V8 is quantity: AMT != ORGRPRICE only on the seven rows that V8 != 1
+#V12 is SEQ and V5 is INTERID. Controlling by store, the set of variable is unique if V12 is included, not V5.
+#V9 and V14 were removed - either contained weird values that could not be explained or none at all.
+```
+
+```{r clustering}
+#zip code to latitude/longitude data
+#https://public.opendatasoft.com/explore/dataset/us-zip-code-latitude-and-longitude/export/
+zip_data <- fread("us-zip-code-latitude-and-longitude.csv")
+zip_data <- zip_data %>% select(Zip, Latitude, Longitude)
+names(zip_data)[1] <- "ZIP"
+
+#add lat/long to store data, remove 4 stores with incorrect ZIP code data
+str <- str %>%
+        left_join(zip_data, by = "ZIP") %>%
+        filter(!is.na(Latitude))
+
+#only keep stores represented in transaction data
+unique_stores <- unique(trnc$STORE)
+str <- str %>%
+        filter(STORE %in% unique_stores)
+
+#standardize longitude/latitude
+str <- str %>% mutate(std_latitude = (Latitude - min(Latitude))/(max(Latitude) - min(Latitude)),
+                      std_longitude = (Longitude - min(Longitude))/(max(Longitude) - min(Longitude)))
+
+#k-medoid method
+k_medoids <- pam(str[, c("std_latitude", "std_longitude")], 10)
+```
+
+```{r appendixB, fig.cap="Store geographical clustering", out.width = "60%", out.height = "60%", fig.align="center"}
+fviz_cluster(k_medoids, data = str[, c("std_latitude", "std_longitude")], 
+             show.clust.cent = T, geom = "point")+
+  coord_flip()+
+  labs(x = "Latitude (standardized)", y = "Longitude (standardized)")+
+  theme_bw()+
+  ggtitle("")
+```
+
+Once we have this reduction in stores, we also look for reducing the number of SKUs in the dataset. To do so, we filter for SKUs that, over the dataset, represent revenues of $2,000 or more - this focuses or attention on products that bring in revenue for the company. 
+
+The next step in the process is defining transactions and baskets. Unfortunately, the transactions dataset does not possess an order ID in which we can identify transactions. So, we utilize the group of variables STORE, TRANNUM, REGISTER and SALEDATE to represent a transaction. This brings us a dataset containing around 450,000 transactions and 3500 SKUs - much more tractable for an association rules algorithm.
+
+A few final details were set to run the association rules algorithm. We set the minimum support necessary for evaluation at 0.0001 (a given rule must occur at least .01% of the time) and minimum confidence at 0.1 (for item 1 $\to$ item 2, item 2 must have been bought in at least 10% of the orders containing item 1). Finally, we set the rule maximum length to 4 items, in order to keep the possible combinations at a reasonable amount, and the number of computations tractable for a common computer.
+
+```{r cleaning}
+# only keep "centroid" stores
+str <- str[k_medoids$id.med,]
+centroid_tn <- as.vector(trnc$STORE %in% as.vector(str$STORE))
+trnc <- trnc %>% 
+  mutate(centroid = centroid_tn) %>%
+  filter(centroid == 1) %>%
+  select(-centroid)
+
+#filter for SKUs that generated more revenue (around 3500 SKUs)
+trnc <- trnc %>%
+          group_by(SKU) %>%
+          mutate(revenue = sum(AMT)) %>%
+          filter(revenue > 2000)
+```
+
+```{r assoc}
+# generate baskets
+tr <- trnc %>%
+        group_by(STORE, SALEDATE, REGISTER, TRANNUM) %>%
+        summarise(basket = paste(SKU,collapse = ",")) %>%
+        ungroup()
+
+# generate transaction-type data
+tr <- tr %>% select(basket)
+write.csv(tr, "transactions.csv", quote = FALSE, row.names = FALSE)
+tr <- read.transactions("transactions.csv", format = 'basket', sep = ",")
+
+# run association rules
+set.seed <- 13
+rules <- apriori(data = tr, 
+                 control = list(verbose=FALSE),
+                 parameter = list(support = 0.0001,  
+                                  confidence = 0.1,
+                                  maxlen = 4)) 
+
+# organize results (top 100 rules, by lift)
+results <- data.frame(inspect(rules), row.names = NULL) %>%
+              top_n(100, lift) %>%
+              arrange(-lift) %>%
+              mutate(Rule = paste0(lhs, Var.2, rhs)) %>%
+              select(Rule, support, confidence, lift)
+```
+
+## Analysis
+
+Our association rules algorithm yielded 293 possible co-occurrence rules. Given that these rules already satisfy the support and confidence cutoffs, we will mostly focus on the lift measure to evaluate these rules, as it is the most important performance measure. Below, in Table \@ref(tab:toprules) you can see the top 10 rules evaluated by the algorithm, by lift - in Appendix A you can check the top 100 rules. 
+
+In all of these cases, we see confidence above .5 and very high lift. Remember that, the farther away from 1 lift is, the better the association rule. We also see that these rules repeat themselves, with inverted order, which might indicate that these items are very frequently bought together, and not as standalone items. For example, if customers often bought item 2 when buying item 1, but customers often bought item 2 without item 1, only the rule {item 1} $\to$ {item 2} would appear. Finally, support is slightly above 0.0001 (0.01% of transactions) for each rule. This means they satisfy the constraint, but none of them are especially common. Once we check all top 100 rules, support can be a bit larger - in some cases, support is above 0.0004 (0.04% of transactions).
+
+```{r toprules}
+head(results, n = 10) %>% kable(caption = "Top 10 Association Rules, by lift")%>%
+  row_spec(0,bold=TRUE) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"))
+```
+
+Unfortunately, the data on SKUs is not complete enough for us to understand what these items are, and if buying them together makes sense. In some cases, however, we do have some clues. For example, the second highest-lift pair (376422 $\to$ 7316422) apparently relates a set of bath towels (376422) to a set of hand towels (7316422) by the same brand (Crosscill). This is a pairing that is reasonable, and serves to validate our association rules analysis.
+
+Given this analysis, we present 100 possible SKU moves that pairs items that are frequently bought together, potentially generating more revenue to the department store chain. With these 100 possibly promising moves, the company can choose 20 moves to be made across each store, while maximizing revenue.
+
+\newpage
+
+## Appendix A: Rules
+
+```{r appendixA}
+results %>% 
+  kable(caption = "Top 100 Association Rules, by lift", longtable = T) %>%
+  row_spec(0,bold=TRUE) %>%
+  kable_styling(latex_options = c("striped", "HOLD_position"))
+```
